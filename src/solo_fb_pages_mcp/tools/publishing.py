@@ -173,6 +173,79 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
 
     @mcp.tool(annotations=WRITE)
     @errors
+    async def set_page_picture(
+        page: str,
+        image: str,
+        filename: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Set the Page's profile picture (logo).
+
+        Use a square image at least 320x320; this replaces the current profile picture. Requires pages_manage_metadata.
+        dry_run=true returns the exact request without sending."""
+        p = ctx.resolve(page)
+        ctx.guard_write()
+        m = media(image, "image", filename)
+        args = {"page": page, "image": image}
+        tok = ctx.token(p)
+        if m.is_url:
+            req = g.build("POST", f"{p.page_id}/picture", token=tok, data={"picture": m.url})
+        else:
+            req = g.build("POST", f"{p.page_id}/picture", token=tok, files={"source": m.as_file()})
+        if dry_run:
+            return ctx.dry_run("set_page_picture", p, args, [req])
+
+        async def run() -> dict[str, Any]:
+            return {"page_id": p.page_id, "result": await g.send(req)}
+
+        return await ctx.write("set_page_picture", p, args, run)
+
+    @mcp.tool(annotations=WRITE)
+    @errors
+    async def set_page_cover(
+        page: str,
+        image: str,
+        offset_y: int | None = None,
+        no_feed_story: bool = True,
+        filename: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Set the Page's cover photo.
+
+        Recommended size is 1640x624 (minimum 851x315); this replaces the current cover. no_feed_story=true avoids a feed post.
+        dry_run=true returns both requests."""
+        p = ctx.resolve(page)
+        ctx.guard_write()
+        if offset_y is not None and not 0 <= offset_y <= 100:
+            raise ValueError("offset_y must be between 0 and 100")
+        m = media(image, "image", filename)
+        args = {"page": page, "image": image, "offset_y": offset_y, "no_feed_story": no_feed_story}
+        tok = ctx.token(p)
+        photo_data: dict[str, Any] = {"published": False}
+        if m.is_url:
+            photo_data["url"] = m.url
+            photo_req = g.build("POST", f"{p.page_id}/photos", token=tok, data=photo_data)
+        else:
+            photo_req = g.build("POST", f"{p.page_id}/photos", token=tok, data=photo_data, files={"source": m.as_file()})
+
+        def cover_req(photo_id: str) -> GraphRequest:
+            data: dict[str, Any] = {"cover": photo_id, "no_feed_story": no_feed_story}
+            if offset_y is not None:
+                data["offset_y"] = offset_y
+            return g.build("POST", p.page_id, token=tok, data=data)
+
+        if dry_run:
+            return ctx.dry_run("set_page_cover", p, args, [photo_req, cover_req("<photo_id>")])
+
+        async def run() -> dict[str, Any]:
+            photo_id = str((await g.send(photo_req))["id"])
+            result = await g.send(cover_req(photo_id))
+            return {"page_id": p.page_id, "photo_id": photo_id, "result": result}
+
+        return await ctx.write("set_page_cover", p, args, run)
+
+    @mcp.tool(annotations=WRITE)
+    @errors
     async def create_video_post(
         page: str,
         video: str,
