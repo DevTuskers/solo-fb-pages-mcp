@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -84,6 +84,20 @@ class KeyClaimRow(Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class FbCallbackRow(Base):
+    """A deauthorize/data-deletion signed_request from Facebook, kept until an agent request brings the app
+    secret needed to verify it (the server holds no Facebook secrets)."""
+
+    __tablename__ = "fb_callbacks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    signed_request: Mapped[str] = mapped_column(Text)
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class AuditLogRow(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -142,9 +156,9 @@ def make_engine(database_url: str) -> Engine:
 
 
 class Store:
-    def __init__(self, database_url: str, cipher: TokenCipher) -> None:
+    def __init__(self, database_url: str, cipher: TokenCipher | Callable[[], TokenCipher]) -> None:
         self.engine = make_engine(database_url)
-        self.cipher = cipher
+        self._cipher: Callable[[], TokenCipher] = (lambda: cipher) if isinstance(cipher, TokenCipher) else cipher
         Base.metadata.create_all(self.engine)
         self._migrate()
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
@@ -155,6 +169,30 @@ class Store:
         if "client" not in cols:
             with self.engine.begin() as conn:
                 conn.execute(text("ALTER TABLE audit_log ADD COLUMN client VARCHAR(64)"))
+
+    @property
+    def cipher(self) -> TokenCipher:
+        """Cipher for the current request's token key (raises if the request carries none)."""
+        return self._cipher()
+
+    def _check_cipher(self, s: Session, cipher: TokenCipher) -> None:
+        """Refuse to encrypt with a key that cannot read the tokens already stored."""
+        row = s.scalars(select(PageRow).limit(1)).first()
+        if row is not None:
+            cipher.decrypt(row.page_token_enc)
+
+    def rewrap(self, old: TokenCipher, new: TokenCipher) -> int:
+        """Re-encrypt every stored Page/user token from `old` to `new` key. Returns the number re-encrypted."""
+        n = 0
+        with self.session() as s:
+            for p in s.scalars(select(PageRow)):
+                p.page_token_enc = new.encrypt(old.decrypt(p.page_token_enc))
+                n += 1
+            for u in s.scalars(select(FbUserRow)):
+                if u.user_token_enc:
+                    u.user_token_enc = new.encrypt(old.decrypt(u.user_token_enc))
+                    n += 1
+        return n
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -206,6 +244,8 @@ class Store:
                 clash = s.scalars(select(PageRow).where(PageRow.alias == alias, PageRow.page_id != page_id)).first()
                 if clash is not None:
                     raise ValueError(f"alias '{alias}' is already used by page {clash.page_id}")
+            cipher = self.cipher
+            self._check_cipher(s, cipher)
             row = s.get(PageRow, page_id)
             if row is None:
                 row = PageRow(page_id=page_id)
@@ -214,7 +254,7 @@ class Store:
             if alias is not None:
                 row.alias = alias
             row.tasks = json.dumps(sorted(tasks))
-            row.page_token_enc = self.cipher.encrypt(page_token)
+            row.page_token_enc = cipher.encrypt(page_token)
             row.connected_by_user_id = connected_by_user_id
             row.connected_at = utcnow()
             row.status = STATUS_ACTIVE
@@ -237,12 +277,14 @@ class Store:
 
     def upsert_user(self, *, user_id: str, name: str, user_token: str, expires_in: int | None) -> None:
         with self.session() as s:
+            cipher = self.cipher
+            self._check_cipher(s, cipher)
             row = s.get(FbUserRow, user_id)
             if row is None:
                 row = FbUserRow(user_id=user_id)
                 s.add(row)
             row.name = name
-            row.user_token_enc = self.cipher.encrypt(user_token)
+            row.user_token_enc = cipher.encrypt(user_token)
             row.user_token_expires_at = utcnow() + timedelta(seconds=expires_in) if expires_in else None
 
     def user_token(self, user_id: str) -> str | None:
@@ -305,6 +347,37 @@ class Store:
                 return False
             row.used = True
             return True
+
+    # ---- Facebook callbacks awaiting verification ---------------------------------------------------------
+
+    MAX_PENDING_CALLBACKS = 200
+
+    def add_fb_callback(self, kind: str, signed_request: str, code: str) -> None:
+        with self.session() as s:
+            pending = s.scalars(select(FbCallbackRow).where(FbCallbackRow.processed_at.is_(None))).all()
+            if len(pending) >= self.MAX_PENDING_CALLBACKS:
+                raise ValueError("too many unverified Facebook callbacks")
+            s.add(FbCallbackRow(kind=kind, signed_request=signed_request, code=code))
+
+    def pending_fb_callbacks(self) -> list[tuple[int, str, str]]:
+        with self.session() as s:
+            q = select(FbCallbackRow).where(FbCallbackRow.processed_at.is_(None)).order_by(FbCallbackRow.id)
+            return [(r.id, r.kind, r.signed_request) for r in s.scalars(q)]
+
+    def finish_fb_callback(self, callback_id: int, result: str) -> None:
+        with self.session() as s:
+            row = s.get(FbCallbackRow, callback_id)
+            if row is not None:
+                row.processed_at = utcnow()
+                row.result = result
+                row.signed_request = ""
+
+    def fb_callback_status(self, code: str) -> str | None:
+        with self.session() as s:
+            row = s.scalars(select(FbCallbackRow).where(FbCallbackRow.code == code)).first()
+            if row is None:
+                return None
+            return "processed" if row.processed_at else "pending"
 
     # ---- MCP client keys ---------------------------------------------------------------------------------
 

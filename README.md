@@ -45,33 +45,33 @@ Notes:
 - `/mcp` rejects requests without a bearer key: the primary `MCP_API_KEY` (client `owner`, constant-time compare) or a
   named client key (`create_client_key`, stored only as a SHA-256 hash, handed over once via a 15-minute `/keys/claim` link).
   Each audit-log entry records the client. DNS-rebinding protection is on.
-- `/onboard` needs a one-time link (`create_onboarding_link`, 15 min, single use) or `ADMIN_PASSWORD`; failed logins are rate-limited.
+- **The server stores no Facebook secrets.** Each client sends `Authorization: Bearer <key>~<FB_APP_SECRET>~<TOKEN_KEY>`
+  (or `X-FB-App-Secret` / `X-SFPM-Token-Key` headers); they live only in request memory. Page/user tokens are encrypted
+  with `TOKEN_KEY`, which the server never keeps. It refuses to start if `FB_APP_SECRET`, `TOKEN_ENCRYPTION_KEY` or
+  `ADMIN_PASSWORD` is set. Facebook deauthorize/data-deletion callbacks are queued and verified on the next request
+  that carries the app secret.
+- `/onboard` needs a one-time link (`create_onboarding_link`, 15 min, single use); the request's credentials are held in
+  memory for that link only.
 - OAuth uses a single-use `state` (10 min) bound to the browser session; the code exchange happens server-side.
 - Page and user tokens are Fernet-encrypted in SQLite. Onboarding links are stored only as SHA-256 hashes.
 - Tokens are sent in the `Authorization` header, never logged; logs, errors, tool outputs and the audit log are redacted.
-- Auth errors (code 190 etc.) mark the Page `needs_reconnect`; a background job checks every token daily.
+- Auth errors (code 190 etc.) mark the Page `needs_reconnect`; `check_page_connection` validates a token on demand.
 - Rate limits (4, 17, 32, 613, 80001, ...) are retried with exponential backoff, and the client slows down when usage headers pass 90 %.
 - `READ_ONLY=true` blocks all writes. `ALLOWED_PAGE_IDS` restricts which connected Pages can be used. Every write is audit-logged.
 
 ### Kill switch
 
 1. Remove the app in Facebook **Settings & privacy > Settings > Business Integrations** (this revokes all tokens).
-2. `fly secrets set -a solo-fb-pages-mcp MCP_API_KEY=<new>` and `revoke_client_key` for each named client.
+2. `revoke_client_key` for each client (and `fly secrets unset MCP_API_KEY` if set).
 3. Reset the App Secret in the Meta dashboard (**App settings > Basic**).
 4. `fly tokens list` then `fly tokens revoke <id>` for the Fly token.
 
 ## Configuration
 
-See [`.env.example`](.env.example). Required: `MCP_API_KEY`, `TOKEN_ENCRYPTION_KEY`, and for onboarding `FB_APP_ID`,
-`FB_APP_SECRET`, `FB_LOGIN_CONFIG_ID`, `ADMIN_PASSWORD`, `PUBLIC_BASE_URL`.
-
-Generate secrets:
-
-```bash
-openssl rand -hex 32                 # MCP_API_KEY
-openssl rand -base64 24              # ADMIN_PASSWORD
-uv run solo-fb-pages-mcp --gen-key   # TOKEN_ENCRYPTION_KEY (losing it means reconnecting every Page)
-```
+See [`.env.example`](.env.example). Server (Fly): `FB_APP_ID`, `FB_LOGIN_CONFIG_ID`, `PUBLIC_BASE_URL`, optional
+`MCP_API_KEY`. Clients (their own secret store): `FB_APP_SECRET` and the token key
+(`uv run solo-fb-pages-mcp --gen-key`; losing it means reconnecting every Page). `FB_APP_SECRET` and
+`TOKEN_ENCRYPTION_KEY` in `.env` are for local `--stdio` development only.
 
 ## Local development
 
@@ -133,30 +133,18 @@ To revoke at any time: Facebook **Settings & privacy > Settings > Business Integ
 
 ## Connecting a Page
 
-1. Ask the agent to call `create_onboarding_link` (or open `https://<MCP_HOST>/onboard` and use `ADMIN_PASSWORD`).
+1. Ask the agent to call `create_onboarding_link` and open the link it gives you.
 2. Click **Continue with Facebook**, pick the Pages in Facebook's dialog, approve.
 3. Choose which Pages to save and optional aliases. Pages missing `CREATE_CONTENT`/`MODERATE` are flagged.
 4. Repeat any time to add Pages or reconnect one marked `needs_reconnect`.
 
 ## Part F: Hosting on Fly.io
 
-### F1. Account and token (owner)
-1. Sign up at https://fly.io and add a payment method.
-2. Install flyctl, `fly auth login`, then: `fly tokens create org --name devin-solo-fb-pages-mcp --expiry 2160h`
-3. Save it as Devin secret `FLY_API_TOKEN` and GitHub Actions secret `FLY_API_TOKEN`.
-
-### F2. First deploy
-
-```bash
-fly launch --name solo-fb-pages-mcp --no-deploy --copy-config
-fly volumes create data --size 1 -a solo-fb-pages-mcp -r sin
-fly secrets set -a solo-fb-pages-mcp MCP_API_KEY="$MCP_API_KEY" ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-  TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY" FB_APP_ID="$FB_APP_ID" FB_APP_SECRET="$FB_APP_SECRET" \
-  FB_LOGIN_CONFIG_ID="$FB_LOGIN_CONFIG_ID"
-fly deploy && fly scale count 1 -a solo-fb-pages-mcp
-```
-
-Keep exactly **one Machine** (SQLite on a volume). If the app name differs, update `app` and `PUBLIC_BASE_URL` in `fly.toml`.
+### F1-F2. Account and first deploy
+Run from an agent VM; full steps in `get_guide("fly-deploy")`. Summary: `fly auth login` (owner approves in the
+browser), `fly apps create`, `fly volumes create data --size 1`, `fly secrets set FB_APP_ID=... FB_LOGIN_CONFIG_ID=...`,
+`fly deploy --remote-only --ha=false`, then the first client key via
+`fly ssh console -C "solo-fb-pages-mcp --create-key-link <org>"`. Keep exactly **one Machine** (SQLite on a volume).
 
 ### F3. CI/CD
 - `ci.yml`: ruff, mypy, pytest on every PR and push to `main`.
@@ -170,7 +158,8 @@ It covers status, logs, secrets, machines, volumes and certs, not deploys. Never
 ## Connecting the server to Devin
 
 Each Devin organization gets its own key: an agent with access calls `create_client_key(name="<org>")`, the owner opens
-the one-time link, reveals the key and saves it as org secret `MCP_SOLO_FB_PAGES_API_KEY`. Then **Customize > MCPs >
+the one-time link, reveals the value (`<key>~<FB_APP_SECRET>~<TOKEN_KEY>`) and saves it as org secret
+`MCP_SOLO_FB_PAGES_API_KEY`. Then **Customize > MCPs >
 Add MCP > Add custom MCP**: transport **HTTP**, URL `https://<MCP_HOST>/mcp`, Auth Header `Authorization` =
 `Bearer ${MCP_SOLO_FB_PAGES_API_KEY}`. Full steps: `get_guide("devin-setup")`.
 

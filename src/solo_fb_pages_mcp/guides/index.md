@@ -24,8 +24,9 @@ If you cannot reach the MCP yet, the same files are in the repo under `src/solo_
 
 1. **The owner never runs commands on their laptop.** Agents run every CLI command on their own VM. The owner only
    clicks in a browser (Meta dashboard, Fly login approval, one-time links) and pastes values into secure secret forms.
-2. **Never put secrets in chat, git, PR text or logs.** Secrets: Fly secrets on the server, the agent platform's secret
-   store for the agent (Devin: org secrets). Facebook App ID and Page IDs are not secret.
+2. **Never put secrets in chat, git, PR text or logs.** The server stores no Facebook secrets: each agent keeps
+   `FB_APP_SECRET` and the token key in its own secret store (Devin: org secrets) and sends them with every request.
+   Facebook App ID, login configuration ID and Page IDs are not secret.
 3. **Never write to a real Page without the owner asking for that specific change.** Use the owner's throwaway test Page
    (ask which one; often alias `test`) for experiments, and delete what you create.
 4. One-time links (`create_onboarding_link`, `create_client_key`) are for the owner to open. Never open them yourself.

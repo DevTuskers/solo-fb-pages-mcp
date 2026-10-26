@@ -10,7 +10,7 @@ from solo_fb_pages_mcp.crypto import TokenCipher, generate_fernet_key
 from solo_fb_pages_mcp.storage import Store
 from solo_fb_pages_mcp.tools.guides import TOPICS
 
-from .conftest import MCP_KEY, call
+from .conftest import APP_SECRET, CREDS, MCP_KEY, TOKEN_KEY, call
 from .test_web import client, mcp_post  # noqa: F401
 
 INIT = {
@@ -69,12 +69,13 @@ def _tool(c: TestClient, key: str, name: str, args: dict) -> dict:
 
 
 def test_client_key_lifecycle(client: TestClient) -> None:  # noqa: F811
-    res = _tool(client, MCP_KEY, "create_client_key", {"name": "devtuskers"})
+    res = _tool(client, CREDS, "create_client_key", {"name": "devtuskers"})
     url = res["structuredContent"]["claim_url"]
     assert MCP_KEY not in str(res)
     ctx = client.app_ctx  # type: ignore[attr-defined]
     assert ctx.store.list_client_keys() == []  # nothing changes until the owner reveals the key
     key = _claim(client, url)
+    assert key.split("~")[1:] == [APP_SECRET, TOKEN_KEY]  # Facebook credentials ride along in the one secret
     assert key != MCP_KEY and mcp_post(client, INIT, key=key).status_code == 200
 
     _tool(client, key, "create_onboarding_link", {})
@@ -88,6 +89,7 @@ def test_client_key_lifecycle(client: TestClient) -> None:  # noqa: F811
 
     # rotating: a second reveal replaces the old key
     key2 = _claim(client, _tool(client, MCP_KEY, "create_client_key", {"name": "devtuskers"})["structuredContent"]["claim_url"])
+    assert "~" not in key2  # created without credentials: plain key, page warns
     assert mcp_post(client, INIT, key=key).status_code == 401
     assert mcp_post(client, INIT, key=key2).status_code == 200
 

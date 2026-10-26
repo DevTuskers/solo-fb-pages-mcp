@@ -146,9 +146,11 @@ class GraphClient:
         *,
         http: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        app_secret: Callable[[], str | None] | None = None,
     ) -> None:
         self.settings = settings
         self.redactor = redactor
+        self._app_secret = app_secret or (lambda: settings.fb_app_secret or None)
         self._http = http or httpx.AsyncClient(timeout=settings.graph_timeout_seconds)
         self._sleep = sleep
         self._cooldown_level = 0
@@ -162,7 +164,10 @@ class GraphClient:
 
     @property
     def app_token(self) -> str:
-        return f"{self.settings.fb_app_id}|{self.settings.fb_app_secret}"
+        secret = self._app_secret()
+        if not secret:
+            raise ValueError("No Facebook app secret in this request.")
+        return f"{self.settings.fb_app_id}|{secret}"
 
     def url(self, path: str, host: Host = "graph") -> str:
         if host == "absolute":
@@ -191,8 +196,9 @@ class GraphClient:
         auth_scheme: str = "Bearer",
     ) -> GraphRequest:
         q = {k: _form_value(v) for k, v in (params or {}).items() if v is not None}
-        if token and self.settings.fb_app_secret:
-            q["appsecret_proof"] = appsecret_proof(token, self.settings.fb_app_secret)
+        secret = self._app_secret() if token else None
+        if token and secret:
+            q["appsecret_proof"] = appsecret_proof(token, secret)
         body = {k: _form_value(v) for k, v in data.items() if v is not None} if data is not None else None
         return GraphRequest(
             method=method.upper(),
