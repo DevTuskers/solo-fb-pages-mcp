@@ -19,6 +19,7 @@
 |---|---|
 | Text post (optional link) | `create_post(page, message, link=None, scheduled_time=None)` |
 | Photo / several photos | `create_photo_post(page, image, caption)` / `create_multi_photo_post(page, images, message)` |
+| Profile picture / cover photo | `set_page_picture(page, image)` / `set_page_cover(page, image, offset_y=None)` |
 | Video / reel | `create_video_post(page, video, ...)` or `create_reel(page, video, ...)`, then poll `get_video_status` |
 | Schedule | pass `scheduled_time` (ISO-8601 or unix seconds), 10 minutes to 30 days ahead; `list_scheduled_posts` |
 | Edit / hide / unhide / delete a post | `update_post`, `hide_post`, `unhide_post`, `delete_post(confirm=true)` |

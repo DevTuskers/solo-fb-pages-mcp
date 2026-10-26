@@ -22,7 +22,7 @@ verification: Standard Access covers Pages you have a role on.
 | Group | Tools |
 |---|---|
 | Pages | `list_pages`, `get_page_info`, `check_page_connection`, `create_onboarding_link`, `remove_page`*, `get_audit_log` |
-| Publishing | `create_post`, `create_photo_post`, `create_multi_photo_post`, `create_video_post`, `get_video_status`, `create_reel`, `list_posts`, `list_scheduled_posts`, `update_post`, `delete_post`*, `hide_post`, `unhide_post` |
+| Publishing | `create_post`, `create_photo_post`, `create_multi_photo_post`, `set_page_picture`, `set_page_cover`, `create_video_post`, `get_video_status`, `create_reel`, `list_posts`, `list_scheduled_posts`, `update_post`, `delete_post`*, `hide_post`, `unhide_post` |
 | Comments | `list_comments`, `get_comment_replies`, `list_recent_comments`, `comment_on_post`, `reply_to_comment`, `hide_comment`, `unhide_comment`, `bulk_hide_comments`, `delete_comment`* |
 | Reactions | `like`, `unlike`, `get_reactions` |
 | Insights | `get_post_insights`, `get_page_insights` |

@@ -123,7 +123,13 @@ async def test_read_only_blocks_writes(tmp_path, mock) -> None:
     ctx = build_context(make_settings(tmp_path, read_only=True), http=httpx.AsyncClient())
     ctx.store.upsert_page(page_id=PAGE_ID, name="P", tasks=[], page_token=PAGE_TOKEN, connected_by_user_id=None)
     m = build_mcp(ctx)
-    for name, args in [("create_post", {"message": "x"}), ("hide_comment", {"comment_id": "c"}), ("like", {"object_id": "o"})]:
+    for name, args in [
+        ("create_post", {"message": "x"}),
+        ("set_page_picture", {"image": "https://img/x.jpg"}),
+        ("set_page_cover", {"image": "https://img/x.jpg"}),
+        ("hide_comment", {"comment_id": "c"}),
+        ("like", {"object_id": "o"}),
+    ]:
         with pytest.raises(ToolError, match="READ_ONLY"):
             await call(m, name, page=PAGE_ID, **args)
 
@@ -143,6 +149,58 @@ async def test_photo_by_base64_multipart(mcp, mock) -> None:
     await call(mcp, "create_photo_post", page="test", image=data, caption="cap")
     req = route.calls.last.request
     assert req.headers["content-type"].startswith("multipart/form-data") and PNG in req.content and b"image/png" in req.content
+
+
+async def test_set_page_picture_by_url(mcp, mock) -> None:
+    route = mock.post(f"{GRAPH}/{PAGE_ID}/picture").respond(200, json={"success": True})
+    res = await call(mcp, "set_page_picture", page="test", image="https://img/logo.jpg")
+    assert res == {"page_id": PAGE_ID, "result": {"success": True}}
+    assert form(route.calls.last.request) == {"picture": "https://img/logo.jpg"}
+
+
+async def test_set_page_picture_by_base64_multipart(mcp, mock) -> None:
+    route = mock.post(f"{GRAPH}/{PAGE_ID}/picture").respond(200, json={"success": True})
+    data = "data:image/png;base64," + base64.b64encode(PNG).decode()
+    await call(mcp, "set_page_picture", page="test", image=data)
+    req = route.calls.last.request
+    assert req.headers["content-type"].startswith("multipart/form-data") and b'name="source"' in req.content
+
+
+async def test_set_page_cover_by_url_and_audit(mcp, mock, ctx) -> None:
+    photos = mock.post(f"{GRAPH}/{PAGE_ID}/photos").respond(200, json={"id": "ph1"})
+    cover = mock.post(f"{GRAPH}/{PAGE_ID}").respond(200, json={"success": True})
+    res = await call(mcp, "set_page_cover", page="test", image="https://img/cover.jpg")
+    assert res == {"page_id": PAGE_ID, "photo_id": "ph1", "result": {"success": True}}
+    assert form(photos.calls.last.request) == {"published": "false", "url": "https://img/cover.jpg"}
+    cover_form = form(cover.calls.last.request)
+    assert cover_form == {"cover": "ph1", "no_feed_story": "true"} and "offset_y" not in cover_form
+    entry = ctx.store.audit_entries()[0]
+    assert entry["tool"] == "set_page_cover" and entry["ok"]
+
+
+async def test_set_page_cover_offset_y(mcp, mock) -> None:
+    mock.post(f"{GRAPH}/{PAGE_ID}/photos").respond(200, json={"id": "ph1"})
+    cover = mock.post(f"{GRAPH}/{PAGE_ID}").respond(200, json={"success": True})
+    await call(mcp, "set_page_cover", page="test", image="https://img/cover.jpg", offset_y=40)
+    assert form(cover.calls.last.request)["offset_y"] == "40"
+
+    with pytest.raises(ToolError, match="offset_y"):
+        await call(mcp, "set_page_cover", page="test", image="https://img/cover.jpg", offset_y=150)
+
+
+async def test_page_branding_dry_run_sends_nothing(mcp, mock) -> None:
+    picture_route = mock.post(f"{GRAPH}/{PAGE_ID}/picture")
+    photos_route = mock.post(f"{GRAPH}/{PAGE_ID}/photos")
+    cover_route = mock.post(f"{GRAPH}/{PAGE_ID}")
+    picture = await call(mcp, "set_page_picture", page="test", image="https://img/logo.jpg", dry_run=True)
+    cover = await call(mcp, "set_page_cover", page="test", image="https://img/cover.jpg", dry_run=True)
+    assert picture["dry_run"] and picture["requests"][0]["url"] == f"{GRAPH}/{PAGE_ID}/picture"
+    assert picture["requests"][0]["data"] == {"picture": "https://img/logo.jpg"}
+    assert cover["dry_run"] and len(cover["requests"]) == 2
+    assert cover["requests"][0]["url"] == f"{GRAPH}/{PAGE_ID}/photos"
+    assert cover["requests"][1]["url"] == f"{GRAPH}/{PAGE_ID}"
+    assert cover["requests"][1]["data"] == {"cover": "<photo_id>", "no_feed_story": "true"}
+    assert picture_route.call_count == photos_route.call_count == cover_route.call_count == 0
 
 
 async def test_multi_photo(mcp, mock) -> None:
