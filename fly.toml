@@ -1,0 +1,34 @@
+app = "solo-fb-pages-mcp"
+primary_region = "sin"
+
+[build]
+
+[env]
+  DATABASE_URL = "sqlite:////data/solo-fb-pages-mcp.db"
+  GRAPH_API_VERSION = "v26.0"
+  PUBLIC_BASE_URL = "https://solo-fb-pages-mcp.fly.dev"
+  READ_ONLY = "false"
+  REQUIRE_CONFIRM_DESTRUCTIVE = "true"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+  snapshot_retention = 14
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
