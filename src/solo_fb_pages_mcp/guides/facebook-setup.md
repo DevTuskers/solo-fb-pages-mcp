@@ -56,10 +56,13 @@ Left menu: **App settings > Basic**.
 - Copy **App ID** (`FB_APP_ID`, not secret) and click **Show** next to **App secret** (`FB_APP_SECRET`, secret; Facebook
   asks for the password).
 
-## 6. Hand the values to the server
-The agent sends secure secret forms for `FB_APP_ID`, `FB_APP_SECRET`, `FB_LOGIN_CONFIG_ID` (save them for the
-organization), then runs on its VM:
-`fly secrets set -a <app> FB_APP_ID=... FB_APP_SECRET=... FB_LOGIN_CONFIG_ID=...` (values from env vars, never echoed).
+## 6. Hand over the values
+The agent sends secure secret forms for `FB_APP_ID`, `FB_APP_SECRET`, `FB_LOGIN_CONFIG_ID` (saved for the organization).
+- `FB_APP_ID` and `FB_LOGIN_CONFIG_ID` are not secret (they appear in Facebook's login URL). The agent sets them on the
+  server: `fly secrets set -a <app> FB_APP_ID=... FB_LOGIN_CONFIG_ID=...`.
+- `FB_APP_SECRET` **never goes to the server** (it refuses to start if it is set). It stays in the agent's secret store
+  and is sent with every request (see `devin-setup` > "How credentials work").
+
 Check `{{BASE_URL}}/healthz` shows `"facebook_configured": true`.
 
 ## 7. Connect Pages

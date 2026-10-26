@@ -6,7 +6,6 @@ import html
 import json
 import logging
 import time
-from collections import deque
 from typing import Any
 from urllib.parse import urlencode
 
@@ -16,7 +15,8 @@ from starlette.routing import Route
 
 from .config import DEFAULT_SCOPES
 from .context import ToolContext
-from .crypto import constant_time_equals, parse_signed_request, random_token, sign_value, unsign_value
+from .creds import Credentials, using
+from .crypto import constant_time_equals, random_token, sha256_hex, sign_value, unsign_value
 from .graph import GraphError
 
 log = logging.getLogger(__name__)
@@ -25,29 +25,11 @@ SESSION_COOKIE = "sfpm_session"
 REQUIRED_TASKS = ("CREATE_CONTENT", "MODERATE")
 
 
-class LoginRateLimiter:
-    """Failed ADMIN_PASSWORD attempts: max 5 per IP and 20 overall per 15 minutes."""
-
-    def __init__(self, per_ip: int = 5, overall: int = 20, window: float = 900.0) -> None:
-        self.per_ip, self.overall, self.window = per_ip, overall, window
-        self._ip: dict[str, deque[float]] = {}
-        self._all: deque[float] = deque()
-
-    def _prune(self, q: deque[float], now: float) -> None:
-        while q and q[0] < now - self.window:
-            q.popleft()
-
-    def blocked(self, ip: str) -> bool:
-        now = time.monotonic()
-        q = self._ip.setdefault(ip, deque())
-        self._prune(q, now)
-        self._prune(self._all, now)
-        return len(q) >= self.per_ip or len(self._all) >= self.overall
-
-    def failure(self, ip: str) -> None:
-        now = time.monotonic()
-        self._ip.setdefault(ip, deque()).append(now)
-        self._all.append(now)
+LINK_EXPIRED = (
+    "<p class=err>This onboarding link is invalid, expired, already used, or the server restarted since it was "
+    "created.</p><p>Ask your agent for a new one (<code>create_onboarding_link</code>).</p>"
+)
+NEED_LINK = "<p>Open the one-time link your agent gave you (<code>create_onboarding_link</code>), valid 15 minutes.</p>"
 
 
 def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
@@ -71,7 +53,8 @@ class Onboarding:
     def __init__(self, ctx: ToolContext) -> None:
         self.ctx = ctx
         self.s = ctx.settings
-        self.limiter = LoginRateLimiter()
+        # Session cookies only live for one onboarding run, so a per-process signing key is enough.
+        self._sign_key = random_token(32)
 
     # ---- session cookie ----------------------------------------------------------------------------------
 
@@ -79,7 +62,7 @@ class Onboarding:
         raw = request.cookies.get(SESSION_COOKIE)
         if not raw:
             return None
-        value = unsign_value(self.s.token_encryption_key, raw)
+        value = unsign_value(self._sign_key, raw)
         if not value:
             return None
         try:
@@ -94,7 +77,7 @@ class Onboarding:
         data = {**data, "exp": data.get("exp") or int(time.time()) + self.s.admin_session_ttl_minutes * 60}
         resp.set_cookie(
             SESSION_COOKIE,
-            sign_value(self.s.token_encryption_key, json.dumps(data, separators=(",", ":"))),
+            sign_value(self._sign_key, json.dumps(data, separators=(",", ":"))),
             max_age=self.s.admin_session_ttl_minutes * 60,
             httponly=True,
             secure=self.s.base_url.startswith("https://"),
@@ -103,33 +86,30 @@ class Onboarding:
         )
 
     def _csrf(self, session: dict[str, Any]) -> str:
-        return sign_value(self.s.token_encryption_key, f"csrf:{session.get('sid')}").rpartition(".")[2]
+        return sign_value(self._sign_key, f"csrf:{session.get('sid')}").rpartition(".")[2]
 
-    def _client_ip(self, request: Request) -> str:
-        return request.headers.get("fly-client-ip") or (request.client.host if request.client else "unknown")
+    def _creds(self, session: dict[str, Any] | None) -> Credentials | None:
+        return self.ctx.peek_stash(f"sid:{session.get('sid')}") if session else None
 
     # ---- routes ------------------------------------------------------------------------------------------
 
     async def healthz(self, request: Request) -> Response:
-        return JSONResponse({"ok": True, "facebook_configured": self.s.facebook_configured})
+        return JSONResponse({"ok": True, "facebook_configured": self.s.facebook_configured, "credentials": "per-request"})
 
     async def onboard(self, request: Request) -> Response:
         token = request.query_params.get("t")
         if token:
-            if not self.ctx.store.consume_onboarding_link(token):
-                return _page(
-                    "Link expired",
-                    "<p class=err>This onboarding link is invalid, expired or already used.</p>"
-                    "<p>Ask Devin for a new one (<code>create_onboarding_link</code>), or sign in with the admin password below.</p>"
-                    + self._login_form(),
-                    status=403,
-                )
+            creds = self.ctx.pop_stash(f"link:{sha256_hex(token)}")
+            if not self.ctx.store.consume_onboarding_link(token) or creds is None:
+                return _page("Link expired", LINK_EXPIRED, status=403)
+            sid = random_token(16)
+            self.ctx.stash(f"sid:{sid}", creds, self.s.admin_session_ttl_minutes * 60)
             resp = RedirectResponse("/onboard", status_code=303)
-            self._set_session(resp, {"sid": random_token(16)})
+            self._set_session(resp, {"sid": sid})
             return resp
         session = self._session(request)
-        if session is None:
-            return _page("Connect Facebook Pages", self._login_form())
+        if session is None or self._creds(session) is None:
+            return _page("Connect Facebook Pages", NEED_LINK)
         if not self.s.facebook_configured:
             return _page(
                 "Facebook app not configured",
@@ -153,27 +133,6 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
 <p><a class=btn href="/onboard/start">Connect Facebook Pages</a></p>""",
         )
 
-    def _login_form(self) -> str:
-        if not self.s.admin_password:
-            return "<p class=muted>Admin password login is disabled. Use a one-time link from Devin.</p>"
-        return """<form class=card method=post action="/onboard/login">
-<label>Admin password <input type=password name=password autocomplete=current-password required></label>
-<p><button class=btn type=submit>Sign in</button></p></form>"""
-
-    async def login(self, request: Request) -> Response:
-        ip = self._client_ip(request)
-        if self.limiter.blocked(ip):
-            return _page("Too many attempts", "<p class=err>Too many failed attempts. Try again in 15 minutes.</p>", 429)
-        form = await request.form()
-        pw = str(form.get("password") or "")
-        if not self.s.admin_password or not constant_time_equals(pw, self.s.admin_password):
-            self.limiter.failure(ip)
-            log.warning("failed onboarding login from %s", ip)
-            return _page("Sign in failed", "<p class=err>Wrong password.</p>" + self._login_form(), 401)
-        resp = RedirectResponse("/onboard", status_code=303)
-        self._set_session(resp, {"sid": random_token(16)})
-        return resp
-
     def login_url(self, state: str) -> str:
         q: dict[str, str] = {
             "client_id": self.s.fb_app_id,
@@ -190,7 +149,7 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
 
     async def start(self, request: Request) -> Response:
         session = self._session(request)
-        if session is None:
+        if session is None or self._creds(session) is None:
             return RedirectResponse("/onboard", status_code=303)
         if not self.s.facebook_configured:
             return RedirectResponse("/onboard", status_code=303)
@@ -202,6 +161,13 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
 
     async def callback(self, request: Request) -> Response:
         session = self._session(request)
+        creds = self._creds(session)
+        if creds is None:
+            return _page("Invalid login state", "<p class=err>This login session expired. Start again.</p>", 400)
+        with using(creds):
+            return await self._callback(request, session, creds)
+
+    async def _callback(self, request: Request, session: dict[str, Any] | None, creds: Credentials) -> Response:
         params = request.query_params
         state = params.get("state", "")
         if params.get("error"):
@@ -225,7 +191,7 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
                 params={
                     "client_id": self.s.fb_app_id,
                     "redirect_uri": self.s.redirect_uri,
-                    "client_secret": self.s.fb_app_secret,
+                    "client_secret": creds.app_secret,
                     "code": code,
                 },
             )
@@ -237,7 +203,7 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
                 params={
                     "grant_type": "fb_exchange_token",
                     "client_id": self.s.fb_app_id,
-                    "client_secret": self.s.fb_app_secret,
+                    "client_secret": creds.app_secret,
                     "fb_exchange_token": short_tok,
                 },
             )
@@ -283,8 +249,13 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
 
     async def select(self, request: Request) -> Response:
         session = self._session(request)
-        if session is None or not session.get("uid"):
+        creds = self._creds(session)
+        if session is None or not session.get("uid") or creds is None:
             return RedirectResponse("/onboard", status_code=303)
+        with using(creds):
+            return await self._select(session)
+
+    async def _select(self, session: dict[str, Any]) -> Response:
         try:
             accounts = await self._accounts(str(session["uid"]))
         except (GraphError, KeyError) as exc:
@@ -325,8 +296,13 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
 
     async def save(self, request: Request) -> Response:
         session = self._session(request)
-        if session is None or not session.get("uid"):
+        creds = self._creds(session)
+        if session is None or not session.get("uid") or creds is None:
             return RedirectResponse("/onboard", status_code=303)
+        with using(creds):
+            return await self._save(request, session)
+
+    async def _save(self, request: Request, session: dict[str, Any]) -> Response:
         form = await request.form()
         if not constant_time_equals(str(form.get("csrf") or ""), self._csrf(session)):
             return _page("Invalid form", "<p class=err>Form expired. Start again.</p>", 400)
@@ -372,6 +348,7 @@ On the Facebook screen, <b>tick every Page you want to manage</b> (to add a new 
             f"<ul>{lis or '<li>No Pages saved</li>'}{errs}</ul><p>You can close this tab. Devin can now see these Pages via <code>list_pages</code>.</p>",
         )
         resp.delete_cookie(SESSION_COOKIE, path="/")
+        self.ctx.pop_stash(f"sid:{session.get('sid')}")
         return resp
 
     async def privacy(self, request: Request) -> Response:
@@ -396,40 +373,43 @@ remove this app and choose to delete data. Facebook sends a signed request to th
 user record and every Page token you connected. You can also ask the Page owner to delete it directly.</p>""",
         )
 
-    async def data_deletion(self, request: Request) -> Response:
-        data = await self._signed(request)
-        if data is None:
-            return JSONResponse({"error": "invalid signed_request"}, status_code=400)
-        user_id = str(data.get("user_id", ""))
-        n = self.ctx.store.delete_user_data(user_id) if user_id else 0
+    async def _queue(self, request: Request, kind: str) -> str | None:
+        """Queue a signed_request; it is verified and applied on the next agent request (which carries the secret)."""
+        form = await request.form()
+        sr = str(form.get("signed_request") or "")
+        if not sr or len(sr) > 8192 or sr.count(".") != 1:
+            return None
         code = random_token(9)
-        self.ctx.audit("facebook_data_deletion", None, {"user_id": user_id}, {"pages_deleted": n, "code": code}, True)
+        try:
+            self.ctx.store.add_fb_callback(kind, sr, code)
+        except ValueError as exc:
+            log.warning("dropped Facebook %s callback: %s", kind, exc)
+            return None
+        return code
+
+    async def data_deletion(self, request: Request) -> Response:
+        code = await self._queue(request, "data_deletion")
+        if code is None:
+            return JSONResponse({"error": "invalid signed_request"}, status_code=400)
         return JSONResponse({"url": f"{self.s.base_url}/facebook/data-deletion/status?code={code}", "confirmation_code": code})
 
     async def data_deletion_status(self, request: Request) -> Response:
-        code = html.escape(request.query_params.get("code", ""))
+        raw = request.query_params.get("code", "")
+        status = self.ctx.store.fb_callback_status(raw) if raw else None
+        code = html.escape(raw)
+        if status is None:
+            return _page("Data deletion status", f"<p class=err>Unknown request <code>{code}</code>.</p>", 404)
+        if status == "processed":
+            return _page("Data deletion status", f"<p>Deletion request <code>{code}</code> has been processed.</p>")
         return _page(
             "Data deletion status",
-            f"<p>Deletion request <code>{code}</code> has been processed. All data for that user was deleted.</p>",
+            f"<p>Deletion request <code>{code}</code> was received and will be completed within a few days.</p>",
         )
 
     async def deauthorize(self, request: Request) -> Response:
-        data = await self._signed(request)
-        if data is None:
+        if await self._queue(request, "deauthorize") is None:
             return JSONResponse({"error": "invalid signed_request"}, status_code=400)
-        user_id = str(data.get("user_id", ""))
-        n = self.ctx.store.disconnect_user(user_id) if user_id else 0
-        self.ctx.audit("facebook_deauthorize", None, {"user_id": user_id}, {"pages_disconnected": n}, True)
         return JSONResponse({"ok": True})
-
-    async def _signed(self, request: Request) -> dict[str, Any] | None:
-        form = await request.form()
-        sr = str(form.get("signed_request") or "")
-        try:
-            return parse_signed_request(sr, self.s.fb_app_secret)
-        except ValueError as exc:
-            log.warning("rejected signed_request: %s", exc)
-            return None
 
     # ---- one-time MCP client key hand-over ----------------------------------------------------------------
 
@@ -451,15 +431,23 @@ Revealing it replaces any older key for <b>{html.escape(client)}</b>.</p>
         form = await request.form()
         token = str(form.get("t") or "")
         key = random_token()
+        creds = self.ctx.pop_stash(f"claim:{sha256_hex(token)}") if token else None
         client = self.ctx.store.redeem_key_claim(token, key) if token else None
         if client is None:
             return _page("Link expired", "<p class=err>This key link is invalid, expired or already used.</p>", 403)
-        self.ctx.audit("reveal_client_key", None, {"name": client}, {"revealed": True}, True)
+        self.ctx.audit("reveal_client_key", None, {"name": client}, {"with_facebook_credentials": creds is not None}, True)
+        value = creds.combined(key) if creds else key
+        note = (
+            ""
+            if creds
+            else "<p class=warn>This value has no Facebook credentials attached (the link was created without them). "
+            "Append <code>~&lt;FB_APP_SECRET&gt;~&lt;TOKEN_KEY&gt;</code> before storing it, or ask the agent for a new link.</p>"
+        )
         base = html.escape(self.s.base_url)
         return _page(
             "Your MCP key",
             f"""<p class=ok>New key for client <b>{html.escape(client)}</b>. Copy it now: it will never be shown again.</p>
-<div class=card><input type=text id=k readonly value="{html.escape(key)}" onclick="this.select()">
+{note}<div class=card><input type=text id=k readonly value="{html.escape(value)}" onclick="this.select()">
 <p><button class=btn type=button onclick="navigator.clipboard.writeText(document.getElementById('k').value);this.textContent='Copied'">Copy</button></p></div>
 <div class=card><b>Use it in Devin</b><ol>
 <li>Paste it into the secure secret form your Devin session sent (name <code>MCP_SOLO_FB_PAGES_API_KEY</code>, organization scope),
@@ -475,7 +463,6 @@ authentication <b>Auth Header</b>, key <code>Authorization</code>, value <code>B
             Route("/", lambda r: RedirectResponse("/onboard"), methods=["GET"]),
             Route("/healthz", self.healthz, methods=["GET"]),
             Route("/onboard", self.onboard, methods=["GET"]),
-            Route("/onboard/login", self.login, methods=["POST"]),
             Route("/onboard/start", self.start, methods=["GET"]),
             Route("/onboard/select", self.select, methods=["GET"]),
             Route("/onboard/save", self.save, methods=["POST"]),

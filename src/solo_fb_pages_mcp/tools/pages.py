@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..context import ToolContext, handle_errors
-from ..crypto import random_token
+from ..crypto import random_token, sha256_hex
 from ..storage import STATUS_ACTIVE, STATUS_NEEDS_RECONNECT
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -60,9 +60,15 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
     @errors
     async def create_onboarding_link() -> dict[str, Any]:
         """Create a one-time link (valid 15 minutes, single use) that the Page owner opens in a browser to
-        connect new Facebook Pages or reconnect existing ones. Give the URL to the owner; do not open it yourself."""
+        connect new Facebook Pages or reconnect existing ones. Give the URL to the owner; do not open it yourself.
+
+        This request's Facebook credentials are kept in server memory (not on disk) until the link expires,
+        because the browser flow needs them; a server restart invalidates the link."""
+        creds = ctx.require_credentials()
         tok = random_token()
-        expires = ctx.store.create_onboarding_link(tok, ctx.settings.onboarding_link_ttl_minutes)
+        ttl = ctx.settings.onboarding_link_ttl_minutes
+        expires = ctx.store.create_onboarding_link(tok, ttl)
+        ctx.stash(f"link:{sha256_hex(tok)}", creds, ttl * 60)
         ctx.audit("create_onboarding_link", None, {}, {"expires_at": expires.isoformat() + "Z"}, True)
         return {
             "url": f"{ctx.settings.base_url}/onboard?t={tok}",
@@ -112,7 +118,7 @@ async def check_connection(ctx: ToolContext, page_id: str) -> dict[str, Any]:
     if p is None:
         raise KeyError(page_id)
     tok = ctx.token(p)
-    if ctx.settings.fb_app_id and ctx.settings.fb_app_secret:
+    if ctx.settings.fb_app_id and ctx.credentials():
         app_tok = ctx.graph.app_token
         ctx.redactor.add(app_tok)
         res = await ctx.read(p, lambda: ctx.graph.get("debug_token", token=app_tok, params={"input_token": tok}))
