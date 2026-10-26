@@ -360,7 +360,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
         check_post_belongs(p, post_id)
         tok = ctx.token(p)
         req = g.build("POST", post_id, token=tok, data={"is_hidden": hidden})
-        fallback = g.build("POST", post_id, token=tok, data={"timeline_visibility": "hidden" if hidden else "normal"})
+        fallback = g.build("POST", post_id, token=tok, data={"timeline_visibility": "hidden" if hidden else "forced_allow"})
         args = {"page": page, "post_id": post_id}
         if dry_run:
             out = ctx.dry_run(tool, p, args, [req])

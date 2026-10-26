@@ -249,7 +249,7 @@ async def test_hide_post_with_fallback(mcp, mock) -> None:
         ]
     )
     res = await call(mcp, "unhide_post", page="test", post_id=POST)
-    assert res["method"] == "timeline_visibility" and form(route.calls.last.request) == {"timeline_visibility": "normal"}
+    assert res["method"] == "timeline_visibility" and form(route.calls.last.request) == {"timeline_visibility": "forced_allow"}
 
 
 async def test_destructive_dry_run_needs_no_confirm(mcp, mock) -> None:
