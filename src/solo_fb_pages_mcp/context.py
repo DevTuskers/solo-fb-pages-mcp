@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, ParamSpec, TypeVar
 
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.lowlevel.server import request_ctx
 
 from .config import Settings
 from .crypto import Redactor
@@ -75,7 +76,14 @@ class ToolContext:
         return self.redactor.obj(shrink(args))  # type: ignore[no-any-return]
 
     def audit(self, tool: str, page_id: str | None, args: dict[str, Any], result: Any, ok: bool) -> None:
-        self.store.audit(tool=tool, page_id=page_id, args=self.audit_args(args), result=self.redactor.obj(result), ok=ok)
+        self.store.audit(
+            tool=tool,
+            page_id=page_id,
+            args=self.audit_args(args),
+            result=self.redactor.obj(result),
+            ok=ok,
+            client=current_client(),
+        )
 
     def dry_run(self, tool: str, page: Page | None, args: dict[str, Any], reqs: list[GraphRequest]) -> dict[str, Any]:
         result = {
@@ -114,6 +122,17 @@ class ToolContext:
     def _on_graph_error(self, page: Page | None, err: GraphError) -> None:
         if page is not None and err.is_auth_error:
             self.store.set_page_status(page.page_id, STATUS_NEEDS_RECONNECT, checked=True)
+
+
+def current_client() -> str | None:
+    """Name of the MCP client making the current request (set by the HTTP bearer-auth middleware)."""
+    try:
+        request = request_ctx.get().request
+    except LookupError:
+        return None
+    state = getattr(request, "scope", {}).get("state") or {}
+    client = state.get("mcp_client") if isinstance(state, dict) else None
+    return client if isinstance(client, str) else None
 
 
 def handle_errors(redactor_ref: Callable[[], Redactor]) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:

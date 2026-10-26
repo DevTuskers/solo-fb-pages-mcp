@@ -1,4 +1,4 @@
-"""SQLite persistence (SQLAlchemy): Pages, Facebook users, OAuth state, onboarding links and the audit log."""
+"""SQLite persistence (SQLAlchemy): Pages, Facebook users, OAuth state, onboarding links, MCP client keys and the audit log."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, delete, select
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, delete, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -65,10 +65,30 @@ class OnboardingLinkRow(Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ClientKeyRow(Base):
+    """An extra MCP bearer key for one named client (e.g. another Devin organization). Only the hash is stored."""
+
+    __tablename__ = "client_keys"
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    key_hash: Mapped[str] = mapped_column(String(128), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KeyClaimRow(Base):
+    __tablename__ = "key_claims"
+    # sha256 of the one-time claim token; the token itself is never stored.
+    token: Mapped[str] = mapped_column(String(128), primary_key=True)
+    client_name: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class AuditLogRow(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    client: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tool: Mapped[str] = mapped_column(String(64))
     page_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     args_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -126,7 +146,15 @@ class Store:
         self.engine = make_engine(database_url)
         self.cipher = cipher
         Base.metadata.create_all(self.engine)
+        self._migrate()
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a table was first created (create_all never alters tables)."""
+        cols = {c["name"] for c in inspect(self.engine).get_columns("audit_log")}
+        if "client" not in cols:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE audit_log ADD COLUMN client VARCHAR(64)"))
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -278,13 +306,75 @@ class Store:
             row.used = True
             return True
 
+    # ---- MCP client keys ---------------------------------------------------------------------------------
+
+    def create_key_claim(self, token: str, client_name: str, ttl_minutes: int) -> datetime:
+        expires = utcnow() + timedelta(minutes=ttl_minutes)
+        with self.session() as s:
+            s.execute(delete(KeyClaimRow).where(KeyClaimRow.expires_at < utcnow()))
+            s.add(KeyClaimRow(token=sha256_hex(token), client_name=client_name, expires_at=expires))
+        return expires
+
+    def peek_key_claim(self, token: str) -> str | None:
+        """Client name for a valid, unused claim token, without consuming it."""
+        with self.session() as s:
+            row = s.get(KeyClaimRow, sha256_hex(token))
+            if row is None or row.used or row.expires_at < utcnow():
+                return None
+            return row.client_name
+
+    def redeem_key_claim(self, token: str, new_key: str) -> str | None:
+        """Consume a claim token and set `new_key` as that client's key (replacing any older key)."""
+        with self.session() as s:
+            claim = s.get(KeyClaimRow, sha256_hex(token))
+            if claim is None or claim.used or claim.expires_at < utcnow():
+                return None
+            claim.used = True
+            row = s.get(ClientKeyRow, claim.client_name)
+            if row is None:
+                row = ClientKeyRow(name=claim.client_name)
+                s.add(row)
+            row.key_hash = sha256_hex(new_key)
+            row.created_at = utcnow()
+            row.last_used_at = None
+            return claim.client_name
+
+    def client_for_key(self, key: str) -> str | None:
+        with self.session() as s:
+            row = s.scalars(select(ClientKeyRow).where(ClientKeyRow.key_hash == sha256_hex(key))).first()
+            if row is None:
+                return None
+            now = utcnow()
+            if row.last_used_at is None or row.last_used_at < now - timedelta(minutes=5):
+                row.last_used_at = now
+            return row.name
+
+    def list_client_keys(self) -> list[dict[str, Any]]:
+        with self.session() as s:
+            return [
+                {
+                    "name": r.name,
+                    "created_at": r.created_at.isoformat() + "Z",
+                    "last_used_at": r.last_used_at.isoformat() + "Z" if r.last_used_at else None,
+                }
+                for r in s.scalars(select(ClientKeyRow).order_by(ClientKeyRow.name))
+            ]
+
+    def delete_client_key(self, name: str) -> bool:
+        with self.session() as s:
+            s.execute(delete(KeyClaimRow).where(KeyClaimRow.client_name == name))
+            return bool(s.execute(delete(ClientKeyRow).where(ClientKeyRow.name == name)).rowcount)  # type: ignore[attr-defined]
+
     # ---- audit -------------------------------------------------------------------------------------------
 
-    def audit(self, *, tool: str, page_id: str | None, args: dict[str, Any], result: Any, ok: bool) -> None:
+    def audit(
+        self, *, tool: str, page_id: str | None, args: dict[str, Any], result: Any, ok: bool, client: str | None = None
+    ) -> None:
         with self.session() as s:
             s.add(
                 AuditLogRow(
                     tool=tool,
+                    client=client,
                     page_id=page_id,
                     args_json=json.dumps(args, default=str)[:20000],
                     result_json=json.dumps(result, default=str)[:20000],
@@ -302,6 +392,7 @@ class Store:
                     "id": r.id,
                     "ts": r.ts.isoformat() + "Z",
                     "tool": r.tool,
+                    "client": r.client,
                     "page_id": r.page_id,
                     "ok": r.ok,
                     "args": json.loads(r.args_json),

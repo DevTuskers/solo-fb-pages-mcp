@@ -431,6 +431,45 @@ user record and every Page token you connected. You can also ask the Page owner 
             log.warning("rejected signed_request: %s", exc)
             return None
 
+    # ---- one-time MCP client key hand-over ----------------------------------------------------------------
+
+    async def key_claim_page(self, request: Request) -> Response:
+        token = request.query_params.get("t", "")
+        client = self.ctx.store.peek_key_claim(token) if token else None
+        if client is None:
+            return _page("Link expired", "<p class=err>This key link is invalid, expired or already used.</p>", 403)
+        return _page(
+            "Reveal MCP key",
+            f"""<p>This creates a new MCP access key for client <b>{html.escape(client)}</b>. It is shown <b>once</b>.
+Revealing it replaces any older key for <b>{html.escape(client)}</b>.</p>
+<form class=card method=post action="/keys/claim"><input type=hidden name=t value="{html.escape(token)}">
+<p><button class=btn type=submit>Reveal key</button></p></form>
+<p class=muted>Have the place you will paste it ready first (e.g. the other Devin organization's secret form).</p>""",
+        )
+
+    async def key_claim(self, request: Request) -> Response:
+        form = await request.form()
+        token = str(form.get("t") or "")
+        key = random_token()
+        client = self.ctx.store.redeem_key_claim(token, key) if token else None
+        if client is None:
+            return _page("Link expired", "<p class=err>This key link is invalid, expired or already used.</p>", 403)
+        self.ctx.audit("reveal_client_key", None, {"name": client}, {"revealed": True}, True)
+        base = html.escape(self.s.base_url)
+        return _page(
+            "Your MCP key",
+            f"""<p class=ok>New key for client <b>{html.escape(client)}</b>. Copy it now: it will never be shown again.</p>
+<div class=card><input type=text id=k readonly value="{html.escape(key)}" onclick="this.select()">
+<p><button class=btn type=button onclick="navigator.clipboard.writeText(document.getElementById('k').value);this.textContent='Copied'">Copy</button></p></div>
+<div class=card><b>Use it in Devin</b><ol>
+<li>Paste it into the secure secret form your Devin session sent (name <code>MCP_SOLO_FB_PAGES_API_KEY</code>, organization scope),
+or add it yourself at <b>Settings &gt; Secrets</b> (app.devin.ai/settings/secrets).</li>
+<li>Add the MCP at <b>Customize &gt; MCPs &gt; Add MCP &gt; Add custom MCP</b>: transport <b>HTTP</b>, URL <code>{base}/mcp</code>,
+authentication <b>Auth Header</b>, key <code>Authorization</code>, value <code>Bearer ${{MCP_SOLO_FB_PAGES_API_KEY}}</code>. Save, then <b>Test tools</b>.</li>
+</ol></div>
+<p class=muted>Lost it? Ask an agent that already has this MCP to run <code>create_client_key</code> again; revoke with <code>revoke_client_key</code>.</p>""",
+        )
+
     def routes(self) -> list[Route]:
         return [
             Route("/", lambda r: RedirectResponse("/onboard"), methods=["GET"]),
@@ -441,6 +480,8 @@ user record and every Page token you connected. You can also ask the Page owner 
             Route("/onboard/select", self.select, methods=["GET"]),
             Route("/onboard/save", self.save, methods=["POST"]),
             Route("/oauth/callback", self.callback, methods=["GET"]),
+            Route("/keys/claim", self.key_claim_page, methods=["GET"]),
+            Route("/keys/claim", self.key_claim, methods=["POST"]),
             Route("/privacy", self.privacy, methods=["GET"]),
             Route("/facebook/data-deletion", self.data_deletion_info, methods=["GET"]),
             Route("/facebook/data-deletion", self.data_deletion, methods=["POST"]),

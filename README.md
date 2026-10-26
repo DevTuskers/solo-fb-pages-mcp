@@ -10,6 +10,10 @@ as Devin uses the tools over Streamable HTTP.
 - Graph API `v26.0` (one setting, `GRAPH_API_VERSION`); every call carries `appsecret_proof`
 - Hosting: Fly.io, one always-on Machine + one volume
 
+**Agents: start with the built-in guides.** Call the `get_guide` tool (or read the MCP resources `guide://<topic>`):
+`index`, `using`, `devin-setup` (connect another Devin org), `facebook-setup`, `fly-deploy`, `troubleshooting`.
+The same files live in [`src/solo_fb_pages_mcp/guides/`](src/solo_fb_pages_mcp/guides/).
+
 Because only you (and people with an app role) log in, the Meta app needs **no App Review** and no business
 verification: Standard Access covers Pages you have a role on.
 
@@ -22,6 +26,7 @@ verification: Standard Access covers Pages you have a role on.
 | Comments | `list_comments`, `get_comment_replies`, `list_recent_comments`, `comment_on_post`, `reply_to_comment`, `hide_comment`, `unhide_comment`, `bulk_hide_comments`, `delete_comment`* |
 | Reactions | `like`, `unlike`, `get_reactions` |
 | Insights | `get_post_insights`, `get_page_insights` |
+| Access & help | `create_client_key`, `list_client_keys`, `revoke_client_key`*, `get_guide` |
 
 `*` destructive: requires `confirm=true` (unless `REQUIRE_CONFIRM_DESTRUCTIVE=false`).
 
@@ -37,7 +42,9 @@ Notes:
 
 ## Safety
 
-- `/mcp` rejects requests without the bearer key (constant-time compare). DNS-rebinding protection is on.
+- `/mcp` rejects requests without a bearer key: the primary `MCP_API_KEY` (client `owner`, constant-time compare) or a
+  named client key (`create_client_key`, stored only as a SHA-256 hash, handed over once via a 15-minute `/keys/claim` link).
+  Each audit-log entry records the client. DNS-rebinding protection is on.
 - `/onboard` needs a one-time link (`create_onboarding_link`, 15 min, single use) or `ADMIN_PASSWORD`; failed logins are rate-limited.
 - OAuth uses a single-use `state` (10 min) bound to the browser session; the code exchange happens server-side.
 - Page and user tokens are Fernet-encrypted in SQLite. Onboarding links are stored only as SHA-256 hashes.
@@ -49,7 +56,7 @@ Notes:
 ### Kill switch
 
 1. Remove the app in Facebook **Settings & privacy > Settings > Business Integrations** (this revokes all tokens).
-2. `fly secrets set -a solo-fb-pages-mcp MCP_API_KEY=<new>` (cuts off every MCP client).
+2. `fly secrets set -a solo-fb-pages-mcp MCP_API_KEY=<new>` and `revoke_client_key` for each named client.
 3. Reset the App Secret in the Meta dashboard (**App settings > Basic**).
 4. `fly tokens list` then `fly tokens revoke <id>` for the Fly token.
 
@@ -153,7 +160,8 @@ Keep exactly **one Machine** (SQLite on a volume). If the app name differs, upda
 
 ### F3. CI/CD
 - `ci.yml`: ruff, mypy, pytest on every PR and push to `main`.
-- `deploy.yml`: `flyctl deploy --remote-only` on push to `main` (needs the `FLY_API_TOKEN` repo secret).
+- No automatic deploy: an agent runs `fly deploy --remote-only --ha=false -a solo-fb-pages-mcp` when the owner asks.
+  Full steps (from an agent VM, nothing on the owner's laptop): `get_guide("fly-deploy")`.
 
 ### F4. Fly.io MCP for Devin (day-2 ops)
 Custom STDIO MCP in Devin: command `fly`, args `["mcp", "server"]`, env `FLY_ACCESS_TOKEN=<FLY_API_TOKEN>`.
@@ -161,8 +169,10 @@ It covers status, logs, secrets, machines, volumes and certs, not deploys. Never
 
 ## Connecting the server to Devin
 
-Settings > MCP servers > Add custom MCP: transport **HTTP**, URL `https://<MCP_HOST>/mcp`,
-header `Authorization: Bearer <MCP_API_KEY>`.
+Each Devin organization gets its own key: an agent with access calls `create_client_key(name="<org>")`, the owner opens
+the one-time link, reveals the key and saves it as org secret `MCP_SOLO_FB_PAGES_API_KEY`. Then **Customize > MCPs >
+Add MCP > Add custom MCP**: transport **HTTP**, URL `https://<MCP_HOST>/mcp`, Auth Header `Authorization` =
+`Bearer ${MCP_SOLO_FB_PAGES_API_KEY}`. Full steps: `get_guide("devin-setup")`.
 
 ## Out of scope for v1
 
