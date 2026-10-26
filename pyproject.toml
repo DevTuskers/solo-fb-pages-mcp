@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "cryptography>=50.0.2",
     "httpx>=0.28.1",
-    "mcp[cli]>=1.27,<2",
+    "mcp[cli]>=1.27,<3",
     "pydantic-settings>=2.16.1",
     "python-multipart>=0.0.32",
     "sqlalchemy>=2.1.6",
