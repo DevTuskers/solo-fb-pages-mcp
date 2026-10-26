@@ -22,7 +22,8 @@ PAGE_TOKEN = "EAAPageToken" + "p" * 40
 USER_TOKEN = "EAAUserToken" + "u" * 40
 APP_SECRET = "app-secret-0123456789abcdef"
 MCP_KEY = "mcp-key-" + "k" * 40
-ADMIN_PW = "admin-password-123"
+TOKEN_KEY = generate_fernet_key()
+CREDS = f"{MCP_KEY}~{APP_SECRET}~{TOKEN_KEY}"
 
 
 def make_settings(tmp_path: Any, **overrides: Any) -> Settings:
@@ -32,13 +33,17 @@ def make_settings(tmp_path: Any, **overrides: Any) -> Settings:
         "fb_login_config_id": "cfg-42",
         "public_base_url": "http://testserver",
         "mcp_api_key": MCP_KEY,
-        "admin_password": ADMIN_PW,
-        "token_encryption_key": generate_fernet_key(),
+        "token_encryption_key": TOKEN_KEY,
         "database_url": f"sqlite:///{tmp_path}/test.db",
         "graph_backoff_base_seconds": 0.0,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
+
+
+def make_server_settings(tmp_path: Any, **overrides: Any) -> Settings:
+    """HTTP server settings: no Facebook secrets (clients send them per request)."""
+    return make_settings(tmp_path, fb_app_secret="", token_encryption_key="", **overrides)
 
 
 @pytest.fixture

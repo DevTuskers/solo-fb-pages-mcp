@@ -47,7 +47,6 @@ class Settings(BaseSettings):
     onboarding_link_ttl_minutes: int = 15
     oauth_state_ttl_minutes: int = 10
     admin_session_ttl_minutes: int = 30
-    health_check_interval_hours: float = 24.0
     graph_max_retries: int = 3
     graph_backoff_base_seconds: float = 2.0
     graph_timeout_seconds: float = 120.0
@@ -76,7 +75,16 @@ class Settings(BaseSettings):
 
     @property
     def facebook_configured(self) -> bool:
-        return bool(self.fb_app_id and self.fb_app_secret and (self.fb_login_config_id or self.fb_login_use_scope))
+        return bool(self.fb_app_id and (self.fb_login_config_id or self.fb_login_use_scope))
+
+    def server_held_secrets(self) -> list[str]:
+        """Secrets that must NOT be configured on an HTTP server (agents send them per request)."""
+        held = (
+            ("FB_APP_SECRET", self.fb_app_secret),
+            ("TOKEN_ENCRYPTION_KEY", self.token_encryption_key),
+            ("ADMIN_PASSWORD", self.admin_password),
+        )
+        return [name for name, value in held if value]
 
     def secret_values(self) -> list[str]:
         """Values that must never appear in logs, errors or tool output."""

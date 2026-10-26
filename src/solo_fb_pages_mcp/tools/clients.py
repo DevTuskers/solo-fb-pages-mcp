@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..context import GuardError, ToolContext, handle_errors
-from ..crypto import random_token
+from ..crypto import random_token, sha256_hex
 
 CLIENT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 RESERVED = {"owner", "local"}
@@ -25,7 +25,11 @@ def validate_client_name(name: str) -> str:
 def create_claim(ctx: ToolContext, name: str) -> dict[str, Any]:
     name = validate_client_name(name)
     tok = random_token()
-    expires = ctx.store.create_key_claim(tok, name, ctx.settings.onboarding_link_ttl_minutes)
+    ttl = ctx.settings.onboarding_link_ttl_minutes
+    expires = ctx.store.create_key_claim(tok, name, ttl)
+    creds = ctx.credentials()
+    if creds is not None:
+        ctx.stash(f"claim:{sha256_hex(tok)}", creds, ttl * 60)
     exists = any(c["name"] == name for c in ctx.store.list_client_keys())
     return {
         "client": name,
@@ -33,6 +37,7 @@ def create_claim(ctx: ToolContext, name: str) -> dict[str, Any]:
         "expires_at": expires.isoformat() + "Z",
         "single_use": True,
         "replaces_existing_key": exists,
+        "includes_facebook_credentials": creds is not None,
     }
 
 
@@ -45,8 +50,10 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
         """Create a one-time link that reveals a NEW MCP bearer key for a named client (e.g. another Devin
         organization: name='devtuskers'). Valid 15 minutes, single use. Give the URL to the owner; do not open it.
 
-        The owner opens it, clicks "Reveal key" and pastes the key straight into the other client's secret store,
-        so the key never appears in chat. Revealing replaces any older key with the same name.
+        The owner opens it, clicks "Reveal key" and pastes the value straight into the other client's secret store,
+        so it never appears in chat. The revealed value is `<key>~<FB_APP_SECRET>~<TOKEN_KEY>`: this request's
+        Facebook credentials are held in server memory until the link expires and appended. Revealing replaces any
+        older key with the same name.
         See get_guide('devin-setup') for the full flow."""
         out = create_claim(ctx, name)
         ctx.audit("create_client_key", None, {"name": out["client"]}, {"expires_at": out["expires_at"]}, True)

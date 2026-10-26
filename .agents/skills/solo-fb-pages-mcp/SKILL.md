@@ -21,5 +21,6 @@ Always:
 - Run commands on your own VM; the owner only clicks in a browser and fills secure secret forms.
 - Never put secrets in chat, git or PR text.
 - Never write to a real Page unless the owner asked; experiment on their test Page and clean up.
+- The server stores no Facebook secrets: clients send `<key>~<FB_APP_SECRET>~<TOKEN_KEY>`; never set them on Fly.
 - Deploy only when the owner asks: `fly deploy --remote-only --ha=false -a solo-fb-pages-mcp`.
 - Checks before committing: `uv run ruff check src tests && uv run ruff format --check src tests && uv run mypy && uv run pytest -q`.
