@@ -80,7 +80,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
 
         Optionally also unsubscribes the app from the Page's webhooks (DELETE /{page}/subscribed_apps)."""
         p = ctx.resolve(page)
-        ctx.guard_write(destructive=True, confirm=confirm)
+        ctx.guard_write(destructive=True, confirm=confirm, dry_run=dry_run)
         args = {"page": page, "unsubscribe_webhooks": unsubscribe_webhooks}
         tok = ctx.token(p)
         reqs = [ctx.graph.build("DELETE", f"{p.page_id}/subscribed_apps", token=tok)] if unsubscribe_webhooks else []

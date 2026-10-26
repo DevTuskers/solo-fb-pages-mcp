@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ..context import UNTRUSTED_NOTE, ToolContext, handle_errors, parse_time, permalink
-from ..graph import GraphRequest
+from ..graph import GraphError, GraphRequest
 from ..storage import Page
 
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
@@ -22,6 +22,8 @@ COMMENT_FIELDS = (
     "id,message,from{id,name},created_time,parent{id},is_hidden,can_hide,can_reply_privately,"
     "like_count,comment_count,attachment{type,url,media{image{src}}},permalink_url"
 )
+
+OWN_COMMENT_HINT = "Facebook does not let a Page hide its own comments; only comments written by other people can be hidden."
 
 
 def comment_view(c: dict[str, Any], page_id: str) -> dict[str, Any]:
@@ -211,6 +213,14 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
     def hide_req(tok: str, comment_id: str, hidden: bool) -> GraphRequest:
         return g.build("POST", comment_id, token=tok, data={"is_hidden": hidden})
 
+    async def send_hide(req: GraphRequest) -> dict[str, Any]:
+        try:
+            return await g.send(req)
+        except GraphError as err:
+            if err.code == 200 and not err.user_message:
+                err.user_message = OWN_COMMENT_HINT
+            raise
+
     async def set_hidden(tool: str, page: str, comment_id: str, hidden: bool, dry_run: bool) -> dict[str, Any]:
         p = ctx.resolve(page)
         ctx.guard_write()
@@ -221,7 +231,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
             return ctx.dry_run(tool, p, args, [req])
 
         async def run() -> dict[str, Any]:
-            res = await g.send(req)
+            res = await send_hide(req)
             return {"comment_id": comment_id, "is_hidden": hidden, "success": res.get("success", True)}
 
         return await ctx.write(tool, p, args, run)
@@ -253,12 +263,10 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
             return ctx.dry_run("bulk_hide_comments", p, args, reqs)
 
         async def run() -> dict[str, Any]:
-            from ..graph import GraphError
-
             results = []
             for cid, r in zip(comment_ids, reqs, strict=True):
                 try:
-                    res = await g.send(r)
+                    res = await send_hide(r)
                     results.append({"comment_id": cid, "ok": bool(res.get("success", True))})
                 except GraphError as err:
                     if err.is_auth_error:
@@ -273,7 +281,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
     async def delete_comment(page: str, comment_id: str, confirm: bool = False, dry_run: bool = False) -> dict[str, Any]:
         """Permanently delete a comment. Destructive: requires confirm=true. Prefer hide_comment."""
         p = ctx.resolve(page)
-        ctx.guard_write(destructive=True, confirm=confirm)
+        ctx.guard_write(destructive=True, confirm=confirm, dry_run=dry_run)
         tok = ctx.token(p)
         req = g.build("DELETE", comment_id, token=tok)
         args = {"page": page, "comment_id": comment_id}

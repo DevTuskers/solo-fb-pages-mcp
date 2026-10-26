@@ -340,7 +340,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
     async def delete_post(page: str, post_id: str, confirm: bool = False, dry_run: bool = False) -> dict[str, Any]:
         """Permanently delete a post. Destructive: requires confirm=true. Consider hide_post instead."""
         p = ctx.resolve(page)
-        ctx.guard_write(destructive=True, confirm=confirm)
+        ctx.guard_write(destructive=True, confirm=confirm, dry_run=dry_run)
         check_post_belongs(p, post_id)
         tok = ctx.token(p)
         req = g.build("DELETE", post_id, token=tok)
@@ -364,7 +364,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
         args = {"page": page, "post_id": post_id}
         if dry_run:
             out = ctx.dry_run(tool, p, args, [req])
-            out["fallback_on_error_100"] = fallback.preview(ctx.redactor)
+            out["fallback_on_error"] = fallback.preview(ctx.redactor)
             return out
 
         async def run() -> dict[str, Any]:
@@ -372,7 +372,7 @@ def register(mcp: FastMCP, ctx: ToolContext) -> None:
                 res = await g.send(req)
                 method = "is_hidden"
             except GraphError as err:
-                if err.code != 100:
+                if err.code not in (1, 100):
                     raise
                 res = await g.send(fallback)
                 method = "timeline_visibility"

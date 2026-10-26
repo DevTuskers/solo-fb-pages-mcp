@@ -242,6 +242,23 @@ async def test_hide_post_with_fallback(mcp, mock) -> None:
     route.mock(side_effect=None, return_value=httpx.Response(200, json={"success": True}))
     res = await call(mcp, "unhide_post", page="test", post_id=POST)
     assert res["method"] == "is_hidden" and form(route.calls.last.request) == {"is_hidden": "false"}
+    route.mock(
+        side_effect=[
+            httpx.Response(500, json={"error": {"message": "An unknown error has occurred.", "code": 1}}),
+            httpx.Response(200, json={"success": True}),
+        ]
+    )
+    res = await call(mcp, "unhide_post", page="test", post_id=POST)
+    assert res["method"] == "timeline_visibility" and form(route.calls.last.request) == {"timeline_visibility": "normal"}
+
+
+async def test_destructive_dry_run_needs_no_confirm(mcp, mock) -> None:
+    res = await call(mcp, "delete_post", page="test", post_id=POST, dry_run=True)
+    assert res["dry_run"] and res["requests"][0]["method"] == "DELETE"
+    res = await call(mcp, "delete_comment", page="test", comment_id="c1", dry_run=True)
+    assert res["dry_run"]
+    res = await call(mcp, "remove_page", page="test", dry_run=True)
+    assert res["would_delete_page_row"] == PAGE_ID
 
 
 # ---- D3 comments ---------------------------------------------------------------------------------------------
@@ -316,6 +333,9 @@ async def test_hide_unhide_bulk_delete_comment(mcp, mock) -> None:
     mock.post(f"{GRAPH}/c2").respond(400, json={"error": {"message": "nope", "code": 100}})
     res = await call(mcp, "bulk_hide_comments", page="test", comment_ids=["c1", "c2"])
     assert res["hidden"] == 1 and not res["results"][1]["ok"]
+    mock.post(f"{GRAPH}/c3").respond(403, json={"error": {"message": "(#200) Can not hide or unhide this comment", "code": 200}})
+    res = await call(mcp, "bulk_hide_comments", page="test", comment_ids=["c3"])
+    assert "own comments" in res["results"][0]["error"]["user_message"]
     with pytest.raises(ToolError, match="confirm"):
         await call(mcp, "delete_comment", page="test", comment_id="c1")
     mock.delete(f"{GRAPH}/c1").respond(200, json={"success": True})

@@ -56,10 +56,10 @@ class ToolContext:
 
     # ---- guardrails --------------------------------------------------------------------------------------
 
-    def guard_write(self, *, destructive: bool = False, confirm: bool = False) -> None:
+    def guard_write(self, *, destructive: bool = False, confirm: bool = False, dry_run: bool = False) -> None:
         if self.settings.read_only:
             raise GuardError("Server is in READ_ONLY mode; write tools are disabled.")
-        if destructive and self.settings.require_confirm_destructive and not confirm:
+        if destructive and self.settings.require_confirm_destructive and not confirm and not dry_run:
             raise GuardError("This is destructive. Call again with confirm=true to proceed.")
 
     def audit_args(self, args: dict[str, Any]) -> dict[str, Any]:
